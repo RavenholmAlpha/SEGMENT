@@ -1,6 +1,6 @@
 // Package integration runs the full Segment stack end to end over real
 // TCP/TLS sockets on loopback: fake-site behavior, full handshake,
-// SOCKS5 TCP + UDP ASSOCIATE, 0-RTT resume, and ticket single-use.
+// SOCKS5 TCP + UDP ASSOCIATE, ticket resume, and ticket single-use.
 package integration
 
 import (
@@ -19,6 +19,7 @@ import (
 
 	"segment/internal/auth"
 	"segment/internal/client"
+	"segment/internal/fakesite"
 	"segment/internal/h2x"
 	"segment/internal/server"
 	"segment/internal/tunnel"
@@ -157,7 +158,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("zero-rtt-resume", func(t *testing.T) {
+	t.Run("ticket-resume", func(t *testing.T) {
 		cli := dialResume(t, serverAddr, authC, cred)
 		defer cli.Close()
 		rc, err := cli.OpenTCP(teHost, tePort)
@@ -191,6 +192,155 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatal("resume with wrong key was accepted")
 		}
 	})
+}
+
+// TestUnauthenticatedMarkerUsesFakeSite ensures even stream 1, when carrying
+// only media markers and no established Segment session, behaves exactly like
+// a normal media fetch.
+func TestUnauthenticatedMarkerUsesFakeSite(t *testing.T) {
+	serverAddr := startSegmentServer(t)
+	tlsConn := dialTLS(t, serverAddr)
+	defer tlsConn.Close()
+	h2c, err := h2x.ClientConn(tlsConn, h2x.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2c.GoAway()
+
+	marked, err := h2c.NewStream(mediaHeaders("/videos/alpha/seg-0.m4s"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tlsConn.SetReadDeadline(time.Now().Add(time.Second))
+	status, body := readH2Response(t, marked)
+	_ = tlsConn.SetReadDeadline(time.Time{})
+	if status != "200" {
+		t.Fatalf("media marker status = %s, want fake-site 200", status)
+	}
+	if len(body) == 0 {
+		t.Fatal("media marker received an empty fake-site body")
+	}
+}
+
+// TestInvalidAuthPostUsesFakeSite ensures both resume-shaped requests without
+// a proof header and full-auth-shaped requests with an invalid proof receive
+// the configured site's normal 404 page rather than a distinctive protocol
+// authentication status.
+func TestInvalidAuthPostUsesFakeSite(t *testing.T) {
+	site := &fakesite.Site{
+		Title:          "Configured probe cover",
+		SegmentSeconds: 6,
+		SegmentSizeKB:  []int{256},
+	}
+	serverAddr := startSegmentServer(t, site)
+
+	tests := []struct {
+		name  string
+		proof string
+	}{
+		{name: "missing-proof-resume-shape"},
+		{name: "present-invalid-full-auth-proof", proof: "definitely-not-a-valid-proof"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tlsConn := dialTLS(t, serverAddr)
+			defer tlsConn.Close()
+			h2c, err := h2x.ClientConn(tlsConn, h2x.DefaultConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h2c.GoAway()
+
+			hdrs := fakeHeaders("POST", "/api/v1/telemetry")
+			if tc.proof != "" {
+				hdrs = append(hdrs, hpack.HeaderField{Name: "x-sg-c", Value: tc.proof})
+			}
+			st, err := h2c.NewStream(hdrs, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.WriteData([]byte("not valid Segment authentication"), true); err != nil {
+				t.Fatal(err)
+			}
+			assertConfiguredAuthCover(t, st)
+		})
+	}
+}
+
+// TestReplayedResumeUsesFakeSite verifies that a valid-but-consumed ticket is
+// indistinguishable from an ordinary request at the HTTP boundary. The auth
+// package separately asserts the exact ErrReplay classification internally.
+func TestReplayedResumeUsesFakeSite(t *testing.T) {
+	site := &fakesite.Site{
+		Title:          "Configured replay cover",
+		SegmentSeconds: 6,
+		SegmentSizeKB:  []int{256},
+	}
+	serverAddr := startSegmentServer(t, site)
+	authC, err := auth.NewClient([]byte(pskStr))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fullTLS := dialTLS(t, serverAddr)
+	full, err := tunnel.Dial(fullTLS, h2x.DefaultConfig(), authC, nil, siteHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := full.Establish(); err != nil {
+		t.Fatal(err)
+	}
+	cred := full.ClientSession()
+	if cred == nil {
+		t.Fatal("full handshake did not return a resumable credential")
+	}
+	_ = full.Close()
+	_ = fullTLS.Close()
+
+	resumeTLS := dialTLS(t, serverAddr)
+	resumed, err := tunnel.Dial(resumeTLS, h2x.DefaultConfig(), authC, cred, siteHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resumed.Close()
+	_ = resumeTLS.Close()
+
+	replayBody, err := auth.BuildResumePayload(cred, make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayTLS := dialTLS(t, serverAddr)
+	defer replayTLS.Close()
+	h2c, err := h2x.ClientConn(replayTLS, h2x.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2c.GoAway()
+	st, err := h2c.NewStream(fakeHeaders("POST", "/api/v1/telemetry"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WriteData(replayBody, true); err != nil {
+		t.Fatal(err)
+	}
+	status, body := readH2Response(t, st)
+	if status != "404" {
+		t.Fatalf("replayed resume status = %s, want fake-site 404", status)
+	}
+	if !strings.Contains(string(body), "Configured replay cover") {
+		t.Fatalf("replayed resume body is not the configured fake-site page: %q", body)
+	}
+}
+
+func assertConfiguredAuthCover(t *testing.T, st *h2x.Stream) {
+	t.Helper()
+	status, body := readH2Response(t, st)
+	if status != "404" {
+		t.Fatalf("invalid auth status = %s, want fake-site 404", status)
+	}
+	if !strings.Contains(string(body), "Configured probe cover") {
+		t.Fatalf("invalid auth body is not the fake-site 404 page: %q", body)
+	}
 }
 
 // --- echo servers ---------------------------------------------------
@@ -246,6 +396,29 @@ func splitAddr(a string) (string, uint16) {
 	return host, uint16(p)
 }
 
+func startSegmentServer(t *testing.T, sites ...*fakesite.Site) string {
+	t.Helper()
+	authSrv, err := auth.NewServer([]byte(pskStr), time.Hour, 30*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := server.SelfSignedCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var site *fakesite.Site
+	if len(sites) > 0 {
+		site = sites[0]
+	}
+	go server.Serve(server.TLSListener(raw, cert), server.Options{Auth: authSrv, Site: site})
+	t.Cleanup(func() { _ = raw.Close() })
+	return raw.Addr().String()
+}
+
 // --- fake-site probe ------------------------------------------------
 
 // getFake speaks h2 directly (no tunnel marker) and returns the
@@ -269,22 +442,39 @@ func getFake(t *testing.T, addr, path string) (string, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hdr := []hpack.HeaderField{
-		{Name: ":method", Value: "GET"},
+	st, err := h2c.NewStream(fakeHeaders("GET", path), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return readH2Response(t, st)
+}
+
+func fakeHeaders(method, path string) []hpack.HeaderField {
+	return []hpack.HeaderField{
+		{Name: ":method", Value: method},
 		{Name: ":scheme", Value: "https"},
 		{Name: ":authority", Value: siteHost},
 		{Name: ":path", Value: path},
 		{Name: "user-agent", Value: "Mozilla/5.0 (test)"},
 	}
-	st, err := h2c.NewStream(hdr, true)
-	if err != nil {
-		t.Fatal(err)
-	}
+}
+
+func mediaHeaders(path string) []hpack.HeaderField {
+	hdr := fakeHeaders("GET", path)
+	return append(hdr,
+		hpack.HeaderField{Name: "sec-fetch-dest", Value: "empty"},
+		hpack.HeaderField{Name: "sec-fetch-mode", Value: "cors"},
+		hpack.HeaderField{Name: "priority", Value: "u=1, i"},
+	)
+}
+
+func readH2Response(t *testing.T, st *h2x.Stream) (string, []byte) {
+	t.Helper()
 	var body []byte
 	for {
 		p, end, err := st.ReadData()
 		if err != nil {
-			t.Fatalf("read body: %v", err)
+			t.Fatalf("read response body: %v", err)
 		}
 		body = append(body, p...)
 		if end {

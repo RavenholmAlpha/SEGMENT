@@ -16,7 +16,7 @@ Segment 是一个以 **TLS 1.3 + HTTP/2 为伪装层（fronting layer）**、内
 |---|---|---|
 | 高伪装性 | 视频流媒体流量形态模拟、h2 指纹模拟、caddy-like 真实服务、帧填充、流量整形 | P0 |
 | 性能 | 零拷贝路径、缓冲池、h2 大窗口、帧级流水线 | P0 |
-| 0-RTT | 内层协议应用层会话恢复（首包即鉴权+数据） | P0 |
+| 票据快速恢复 | 单次票据 + HMAC 通过普通鉴权 POST 恢复；媒体流只在确认后开放 | P0 |
 | TLS-in-TLS 缓解 | 内层全量加密+填充、握手阶段流量整形、尺寸归一化 | P0 |
 | 密钥安全 | 应用层 PSK 鉴权；泄露即失效（可轮换）；服务端密钥不出内存 | P0 |
 | UDP over TCP | UDP 数据报在隧道流内的定长帧封装 | P0 |
@@ -24,9 +24,9 @@ Segment 是一个以 **TLS 1.3 + HTTP/2 为伪装层（fronting layer）**、内
 
 ### 1.1 关键取舍说明
 
-- **为什么用 HTTP/2 而非 QUIC/HTTP3**: 需求明确指定 HTTP/2。h2 基于 TCP，无 0-RTT（TLS 层 1-RTT 恢复后应用层可达 0-RTT）；h2 的流复用、流控、填充位、扩展 CONNECT 等特性足以支撑隧道与伪装。QUIC 可作未来变体。
+- **为什么用 HTTP/2 而非 QUIC/HTTP3**: 需求明确指定 HTTP/2。h2 基于 TCP，不提供 TLS early data；它的流复用、流控、填充位、扩展 CONNECT 等特性足以支撑隧道与伪装。QUIC 可作未来变体。
 - **为什么内层自己做会话加密而不是直接依赖 TLS**: 内层加密使我们能在 TLS 之内再叠一层"内容不可见"，配合填充与整形把内层 TLS 流量（代理 https 站点时）彻底打成媒体数据形态，这是对抗 TLS-in-TLS 检测的关键。
-- **0-RTT 的落地**: Go 标准库 `crypto/tls` 不支持客户端 TLS 1.3 early data，因此 **0-RTT 由内层协议实现**：首次完整握手换取 session ticket 后，后续连接的客户端在 TLS 1-RTT 会话恢复的同一飞行内即携带 `AUTH_RESUME` + 首个隧道流的 `OPEN + DATA`，对应用层而言首包即数据。真 TLS 0-RTT（early data）记为未来工作（§11.4）。
+- **票据恢复的落地**: 首次完整握手换取 session ticket 后，后续连接先通过普通的 `POST /api/v1/telemetry` 提交票据与 HMAC 证明；收到成功确认后才打开媒体标记的控制流和数据流。这牺牲了旧版所谓的“应用层 0-RTT”，换来清晰的认证边界：任何媒体形态的流在连接进入 Ready 之前都只能得到伪站响应。真 TLS 0-RTT（early data）仍记为未来工作（§11.4）。
 
 ---
 
@@ -39,7 +39,7 @@ Segment 是一个以 **TLS 1.3 + HTTP/2 为伪装层（fronting layer）**、内
  │        ▼                                                  │   │   • 鉴权请求   → 隧道流升级                                │
  │ 连接管理器 (dial per 目标 4 元组)                          │   │        │                                                  │
  │        │                                                  │   │        ▼                                                  │
- │ 内层 Segment 协议: 帧编解码 + AES-256-GCM + 填充 + 0-RTT   │   │ 内层 Segment 协议: 帧编解码 + AES-256-GCM + 填充 + 0-RTT   │
+ │ 内层 Segment 协议: 帧编解码 + AES-256-GCM + 填充 + 票据恢复│   │ 内层 Segment 协议: 帧编解码 + AES-256-GCM + 填充 + 票据恢复│
  │        │                                                  │   │        │                                                  │
  │ 伪装层: uTLS(Chrome 指纹) + h2 客户端行为模拟              │◄─TLS1.3/h2─►│ 伪装层: TLS1.3 服务端 + h2 服务器行为模拟              │
  │        │  (媒体请求形态 / SETTINGS / WINDOW_UPDATE 节奏)   │   │        │  (视频站路由 / 媒体节奏)                               │
@@ -66,7 +66,7 @@ D:\SEGMENT\
 │  ├─ segment-server/        # 服务端 CLI
 │  └─ segment-client/        # 客户端 CLI
 ├─ internal/
-│  ├─ auth/                  # PSK 鉴权、session ticket、0-RTT 恢复、防重放
+│  ├─ auth/                  # PSK 鉴权、session ticket、快速恢复、防重放
 │  ├─ h2x/                   # x/net/http2.Framer 封装（双向）
 │  ├─ pacing/                # 媒体节奏流量整形
 │  ├─ segment/               # 内层帧协议、会话加密、填充
@@ -87,7 +87,7 @@ D:\SEGMENT\
 - **证书**: 服务端使用真实 CA 签发的证书（SAN 匹配域名）。v1 不做 ECH/域名前置（CDN fronting 生态已基本关闭），自持域名 + 自持证书是主要部署形态。
 - **密码套件**: 客户端按 Chrome 的 TLS 1.3 套件序（`TLS_AES_128_GCM_SHA256` 优先等）；服务端以 Go 默认 TLS 1.3 套件即可（TLS 1.3 下套件选择对指纹影响小）。
 - **扩展**: 客户端携带 Chrome 常见扩展序（通过 uTLS 模板获得，见 §3.3）；开启 `record_size_limit` 支持（若 Go 版本允许），否则依赖内层填充。
-- **会话恢复**: 客户端开启 TLS 1.3 PSK 恢复（`ClientSessionCache`），使 TLS 层稳定在 1-RTT，配合内层 0-RTT 达到应用层首包即数据。
+- **会话恢复**: 客户端开启 TLS 1.3 PSK 恢复（`ClientSessionCache`），减少外层握手开销；内层票据仍经普通鉴权 POST 验证，不在 TLS early data 中发送。
 
 ### 3.2 HTTP/2 行为模拟（客户端）
 
@@ -99,7 +99,7 @@ D:\SEGMENT\
   - `MAX_CONCURRENT_STREAMS = 1000`
   - `INITIAL_WINDOW_SIZE = 6291456` (6 MiB)
   - `MAX_HEADER_LIST_SIZE = 262144`
-- **连接建立**: 连接前导 `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` + SETTINGS 一并发；不等服务端 SETTINGS 即可开流（这使 0-RTT 可行）。
+- **连接建立**: 连接前导 `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` + SETTINGS 一并发；鉴权 POST 可以立即开流，但媒体标记的控制/数据流必须等待鉴权确认。
 - **流形态**: 隧道流表现为"媒体分段下载"：`GET /videos/{v}/seg-{n}.m4s` 类请求，带 `Range`、`Accept`、`Referer` 等真实播放器头；请求头顺序与 Chrome 一致。
 - **流控节奏**: 收到媒体数据后按"播放器缓冲"节奏回 WINDOW_UPDATE（分批、带抖动），而非一次放满窗口。
 - **填充**: 开启 h2 DATA 帧填充位，填充长度随机，使帧尺寸分布逼近真实媒体分段。
@@ -194,7 +194,7 @@ D:\SEGMENT\
 | Length | 2 B | 密文负载长度（含 GCM tag 16B），≤ 65535 |
 | Payload | 变长 | AES-256-GCM 密文 |
 
-> 头部 4B 明文可见（帧类型/长度），内容全密文（唯一例外：`FRAME_AUTH_RESUME` 为明文帧，§4.2/§5.1）。帧类型只有 6 种，对观测者无信息量；长度被填充归一化后亦无可区分性（§4.4）。
+> 当前传输路径只在鉴权完成后发送 Segment 帧，活动帧负载均为密文。编解码器仍保留旧版明文 `FRAME_AUTH_RESUME` 类型用于线格式兼容与测试，但客户端不再发送、服务端也不再把它作为连接准入信号。帧类型只有 6 种，长度经填充归一化（§4.4）。
 
 **帧类型**:
 
@@ -205,7 +205,7 @@ D:\SEGMENT\
 | 2 | `FRAME_CLOSE` | 双向 | `RST=0x1` | `reason(1B) || padding` |
 | 3 | `FRAME_KEEPALIVE` | 双向 | — | `ts(8B) || padding` |
 | 4 | `FRAME_ACK` | 双向 | — | `echo(8B) || padding`（确认控制帧/探测） |
-| 5 | `FRAME_AUTH_RESUME` | C→S | — | `connNonce(16) || ticket(52) || freshNonce(16) || hmac(32)`（**唯一明文帧**：ticket 为服务端密钥加密的不透明对象，hmac 证明持票者知道会话密钥；固定补齐到 256B） |
+| 5 | `FRAME_AUTH_RESUME` | C→S | — | 旧版兼容类型，明文定长 256B；当前传输不使用，恢复证明改走普通鉴权 POST |
 
 - `FRAME_OPEN`：隧道流上的第一个帧。TCP 通道负载目标地址；UDP 通道负载目标地址+端口，随后该流上的 `FRAME_DATA` 每帧负载 = `dgramLen(2B) || datagram`（一个 UDP 数据报，长度 ≤ MTU 配置，默认 1200）。
 - `FRAME_DATA`：`FIN` 置位表示该方向数据结束（TCP 半关闭）。
@@ -217,7 +217,7 @@ D:\SEGMENT\
 - 会话主密钥 `sessionKey`（32B，服务端在鉴权时生成，随 ticket 下发）。
 - 数据密钥派生: `keyData = HKDF-SHA256(sessionKey, salt=连接随机 nonce, info="segment-data")`；`keyAuth` 仅用于鉴权 blob（§3.5）。
 - **AES-256-GCM**，nonce = 12B：`[8B 会话计数器 BE || 4B 随机前缀]`，计数器每条流独立起点（流 ID 派生），防跨流重放；帧级重放由 GCM 认证失败自然拒绝。
-- 0-RTT 恢复（§5）时，恢复会话沿用原 `sessionKey`，但**每个新连接重新派生** `keyData`（salt=新连接 nonce），保证前向隔离（ticket 泄露不泄露历史流量）。
+- 票据恢复（§5）时，恢复会话沿用原 `sessionKey`，但**每个新连接重新派生** `keyData`（salt=新连接 nonce），保证连接间密钥隔离（ticket 泄露不泄露历史流量）。
 
 ### 4.4 填充策略（尺寸归一化）
 
@@ -244,28 +244,25 @@ D:\SEGMENT\
 
 ---
 
-## 5. 应用层 0-RTT
+## 5. 单次票据快速恢复
 
 ### 5.1 流程
 
 1. **首次连接**: 完整鉴权（§3.5）→ 客户端持有 `ticket + sessionKey`。
-2. **恢复连接**（TLS 1-RTT 会话恢复后）:
-   - 客户端发送 h2 前导 + SETTINGS 后**立即**开两条流（同飞行）：
-     - control 流: 首个帧 = `FRAME_AUTH_RESUME`（**明文帧**，负载 = `connNonce(16) || ticket(52) || freshNonce(16) || hmac(32)`，固定补至 256B；`hmac = HMAC-SHA256(sessionKey, connNonce||freshNonce||ticket)`）；
-     - 数据流: `FRAME_OPEN + FRAME_DATA×n`（已用 `keyData = HKDF(sessionKey, connNonce, "segment-data")` 加密）。
-   - 恢复是**自举**的：客户端已缓存 `sessionKey`，可立即加密数据流；服务端先收到 control 流的明文 `AUTH_RESUME`，校验通过后派生同一 `keyData`，再解密（按到达顺序缓冲的）数据流帧。
-3. **服务端**:
-   - 校验 ticket 单次有效（内存 seen-set：`sha256(ticket)` + TTL 清理）→ 防重放：同一 ticket 二次出现直接断连。
-   - 校验 `hmac`（证明持票者知道 `sessionKey`）→ 通过后**立即**以当前会话密钥处理后续帧（数据零等待）。
-   - 失败 → 服务端回 `FRAME_CLOSE(reason=auth)` 并关闭该流；客户端回退完整鉴权（无需用户干预）。
-   - 服务端重启丢失会话表 → resume 失败 → 客户端同样回退完整握手。
-4. **前向隔离**: 每个新连接重新派生 `keyData`（§4.3），即使某个连接被记录，密钥也无法跨连接复用。
+2. **恢复请求**: 新 TLS/h2 连接先打开普通 `POST /api/v1/telemetry`，请求体为 `connNonce(16) || ticket(52) || freshNonce(16) || hmac(32)`，其中 `hmac = HMAC-SHA256(sessionKey, connNonce||freshNonce||ticket)`。该请求不携带媒体隧道标记。
+3. **服务端准入**:
+   - 先校验 ticket、有效期、单次使用状态与 HMAC，再建立当前连接的会话并返回短 JSON 确认；
+   - 缺失、伪造、过期或重放的证明交给同一个已配置伪站处理，不返回专用的 403、RST 或鉴权帧；
+   - 在连接状态变为 Ready 之前，任何带媒体标记的流（包括首个 stream 1）都交给伪站处理。
+4. **隧道开放**: 客户端只有在收到精确的恢复确认后才派生本连接的 `keyData`，随后打开控制流和数据流。有效隧道流先收到看似媒体响应的 `:status 200`、`content-type: video/mp4`，再开始传输 DATA。
+5. **自动回退**: 恢复失败时客户端在新连接上执行完整鉴权；服务端重启导致旧票据失效时无需用户干预。
+6. **连接间隔离**: 每个新连接重新派生 `keyData`（§4.3），密钥不能跨连接直接复用。
 
 ### 5.2 防重放细节
 
-- ticket 单次有效 + seen-set；`AUTH_RESUME` 的 freshNonce 保证同一 ticket 的两次使用可被区分并拒绝。
-- 恢复连接的**首包数据仅在其后携带控制帧确认后才继续放大窗口**：服务端按首帧认证通过即放行（认证在解密时完成，无额外 RTT）。
-- 真实 0-RTT（TLS early data）回放面（攻击者可重放首包）在本设计中不存在：我们的"首包"发生在 TLS 握手完成之后，攻击者无法在不完成 TLS 的情况下注入。
+- ticket 单次有效 + seen-set；freshNonce 与当前 connNonce 绑定 HMAC，同一票据再次使用会被拒绝。
+- 无效载荷在写入 used 表之前被拒绝；只有已通过密码学校验的有效票据才占用防重放状态，且表有容量上限。
+- 这是 TLS 握手后的“一次请求恢复”，不是 TLS 或应用层 0-RTT；客户端在确认前不会发送隧道数据，因此不存在旧版“未认证媒体流先行”的准入歧义。
 
 ---
 
@@ -410,7 +407,8 @@ keepalive_interval: 20s
   - SOCKS5 TCP CONNECT 隧道 echo；
   - SOCKS5 UDP ASSOCIATE 隧道数据报 echo（命中并修复了 Windows 双栈 IPv6
     UDP socket 的兼容性问题，服务端显式 udp4 + 以客户端 TCP 本地地址回包）；
-  - 0-RTT 恢复：恢复连接上的隧道流量直达；
+  - 票据快速恢复：恢复证明先经普通鉴权 POST，通过后隧道流量直达；
+  - 未认证媒体标记流（包括首个 stream 1）得到伪站响应，不暴露隧道状态；
   - 票据单次使用：同一票据第二次恢复被拒（GOAWAY/RST）；
   - 错误密钥恢复被拒。
 - 竞态: `go test -race ./...` 全绿。
@@ -425,7 +423,7 @@ keepalive_interval: 20s
 | 隧道 1MB bulk（无节奏整形，loopback） | ≈60–115 MB/s |
 | 隧道 1MB bulk（生产节奏整形 256KB/2-8ms） | ≈36 MB/s |
 | 16KB 写+回声 往返 | ≈0.5 ms（时延敏感路径） |
-| 0-RTT 重连（TCP+TLS+h2+AUTH_RESUME+ACK） | ≈0.5 ms |
+| 旧版 0-RTT 重连历史基准 | ≈0.5 ms（当前鉴权 POST 流程需重新测量） |
 
 > 注意：会话表驱逐最初为「满表时全量排序」实现，基准暴露其饱和态 ~245µs/op；
 > 已改为按过期时间的 min-heap 摊销 O(log n) 驱逐，饱和态降至 8.6µs/op（28×）。
@@ -455,7 +453,7 @@ keepalive_interval: 20s
     sync.Pool 20KB 缓冲，GCM 支持 plain/dst 重叠），隧道 relay 数据块按帧上限
     读取；UDP 报文明确拒绝超帧上限（16KB）的报文而非撞池报错。
 - **服务端 DoS 硬化**：鉴权 POST body 上限 64KB（未认证者不能拖垮内存）；
-  0-RTT `Resume` 先校验后记账（无效票据洪泛不增长 `used` 表）+ `used` 容量上限；
+  票据 `Resume` 先校验后记账（无效票据洪泛不增长 `used` 表）+ `used` 容量上限；
   伪站点行 8KB / 头 100 条限额与 h2 preface 识别；TLS 握手与 h2 preface 超时
   （10s）；Accept 瞬时错误退避续跑；`pickSize` 对空/负/超大配置防御；
   时钟回拨不再停摆清理（单调时钟语义）。
@@ -470,8 +468,8 @@ keepalive_interval: 20s
 | L3 Segment 帧 | ✅ | 4B 头，1 h2 DATA = 1 帧（DataChunk=16000 保证单帧不超对端 max frame size） |
 | L4 会话加密/鉴权 | ✅ | AES-256-GCM；每连接 keyData=HKDF(sessionKey, connNonce)；每流每方向子密钥+计数器 nonce |
 | 完整握手 POST /api/v1/telemetry | ✅ | 响应体 = ticket‖sessionKey；服务端同时用握手中的 connNonce 建立该连接 keyData |
-| 应用层 0-RTT | ✅ | 控制流(stream 1) cleartext AUTH_RESUME（定长 256B）；票据单次使用；服务端 FRAME_ACK 确认（用于客户端 WaitReady） |
-| 流劫持伪装 | ✅ | 隧道流 = Chrome 120 媒体 fetch 三头标记（sec-fetch-dest: empty + sec-fetch-mode: cors + priority: u=1,i），无自定义请求头；控制流 ID==1 同标记 |
+| 票据快速恢复 | ✅ | 恢复证明通过普通 `POST /api/v1/telemetry`；票据单次使用；成功确认后才开放媒体标记流 |
+| 流劫持伪装 | ✅ | 隧道流 = Chrome 120 媒体 fetch 三头标记（sec-fetch-dest: empty + sec-fetch-mode: cors + priority: u=1,i），无自定义请求头；Ready 前所有媒体标记流（含 stream 1）统一回落伪站 |
 | UDP over TCP | ✅ | FRAME_OPEN+FlagUDP；1 DATA=1 数据报（单帧上限 DataChunk=16000B）；30s 空闲回收 |
 | 保活 | ✅ | FRAME_KEEPALIVE/FRAME_ACK，客户端 25s 周期 |
 | h2 随机 pad 长度 | ✅ | 0-255 随机，pad 字节全零（与浏览器一致） |
@@ -482,5 +480,5 @@ keepalive_interval: 20s
 | uTLS 客户端指纹 | ✅ | `-tls-fingerprint=chrome`（默认，uTLS HelloChrome_Auto=Chrome 133 规范）\| `go`（stdlib） |
 | 服务端密钥轮换 + 客户端回退 | ✅ | keySrv 每次启动随机（重启作废旧票据）；客户端恢复失败自动回退完整握手并重发新票据 |
 | 配置 | ✅ | `internal/config` YAML（flag 覆盖）；§10 骨架即交付格式 |
-| 会话凭据持久化 | ✅ | `-cred` 文件（0600，base64 ticket+key+expiry）；恢复成功后删除（票据单次使用）；重启客户端即 0-RTT |
-| 断线自愈 | ✅ | 客户端监督 goroutine：连接丢失 → 有界指数退避（1s/2s/4s→30s 上限，±30% 抖动，打破固定重连节奏）重连（0-RTT 恢复，失败回退完整握手）；SOCKS 入口在重连期间等待并重试；Close 可中断进行中的重连（不产生幽灵隧道） |
+| 会话凭据持久化 | ✅ | `-cred` 文件（0600，base64 ticket+key+expiry）；恢复成功后删除（票据单次使用）；重启客户端可快速恢复 |
+| 断线自愈 | ✅ | 客户端监督 goroutine：连接丢失 → 有界指数退避（1s/2s/4s→30s 上限，±30% 抖动，打破固定重连节奏）重连（票据快速恢复，失败回退完整握手）；SOCKS 入口在重连期间等待并重试；Close 可中断进行中的重连（不产生幽灵隧道） |

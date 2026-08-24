@@ -294,7 +294,7 @@ func (s *Session) dir(dir Direction) *streamDir {
 	return s.client
 }
 
-// encodeClear builds the cleartext FRAME_AUTH_RESUME frame.
+// encodeClear builds the legacy cleartext FRAME_AUTH_RESUME frame.
 func encodeClear(t FrameType, f Flags, payload []byte, padTo int) ([]byte, error) {
 	if padTo == 0 {
 		padTo = authResumePadTo

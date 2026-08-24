@@ -157,7 +157,7 @@ func TestCredentialPersistence(t *testing.T) {
 	}
 	_ = c1.Close()
 
-	// Second client: loads the file, resumes 0-RTT without a full
+	// Second client: loads the file and resumes by ticket without a full
 	// handshake; ticket is single-use so the file is then removed.
 	c2 := newTestClient(t, addr, credFile)
 	if _, err := os.Stat(credFile); !os.IsNotExist(err) {

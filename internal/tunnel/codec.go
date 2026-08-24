@@ -1,7 +1,7 @@
 // Package tunnel wires the pieces together: HTTP/2 fronting
 // (internal/h2x) + inner Segment frames (internal/segment) +
 // authentication (internal/auth). It provides the server-side
-// connection manager (control stream, 0-RTT resume, full handshake,
+// connection manager (control stream, ticket resume, full handshake,
 // per-channel relay) and the client-side dialer that exposes tunneled
 // TCP connections and UDP flows to the local SOCKS5/TUN ingress.
 package tunnel

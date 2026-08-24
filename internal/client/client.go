@@ -1,6 +1,6 @@
 // Package client connects the tunnel client side: TLS dial (with a
-// Chrome ClientHello fingerprint via uTLS), h2 fronting, 0-RTT resume
-// with full-handshake fallback, credential persistence for instant
+// Chrome ClientHello fingerprint via uTLS), h2 fronting, ticket resume
+// through the authentication POST with full-handshake fallback, credential persistence for instant
 // reconnect, automatic tunnel supervision/reconnect, and the SOCKS5
 // ingress wiring.
 package client
@@ -89,7 +89,7 @@ func NewWithPSK(opts Options, psk []byte) (*Client, error) {
 	return &Client{opts: opts, authC: authC, closed: make(chan struct{})}, nil
 }
 
-// Connect dials the server, preferring 0-RTT resume (using the cached
+// Connect dials the server, preferring ticket resume (using the cached
 // credential, from memory or the credential file); on resume failure it
 // falls back to the full handshake on a fresh connection, then starts
 // the supervision goroutine that keeps the tunnel alive.
@@ -116,7 +116,7 @@ func (c *Client) Connect() error {
 			c.superviseRun.Do(func() { go c.supervise() })
 			return nil
 		} else {
-			log.Printf("0-RTT resume failed (%v); falling back to full handshake", err)
+			log.Printf("ticket resume failed (%v); falling back to full handshake", err)
 			c.mu.Lock()
 			c.cred = nil
 			c.cli = nil
@@ -147,7 +147,8 @@ func (c *Client) Connect() error {
 var errClosed = errors.New("client: closed")
 
 // connectOnce performs the TCP+TLS+h2 dial; when a valid credential is
-// cached, tunnel.Dial sends the 0-RTT AUTH_RESUME in the first flight.
+// cached, tunnel.Dial completes the ticket-authentication POST before it
+// opens any media-marked stream.
 // Every blocking step observes c.closed: a Close() during a reconnect
 // cancels the dial and tears the half-built tunnel down instead of
 // installing a ghost connection nobody supervises.
@@ -273,7 +274,7 @@ func (c *Client) tlsDial(ctx context.Context, tc net.Conn) (net.Conn, error) {
 }
 
 // supervise watches the tunnel connection and re-establishes it (with
-// 0-RTT resume when a fresh credential exists, else a full handshake)
+// ticket resume when a fresh credential exists, else a full handshake)
 // after any loss, with bounded, jittered backoff.
 func (c *Client) supervise() {
 	for {
@@ -326,7 +327,7 @@ func (c *Client) supervise() {
 	}
 }
 
-// reconnect re-establishes the tunnel after a failure: 0-RTT resume
+// reconnect re-establishes the tunnel after a failure: ticket resume
 // when a valid credential is cached, falling back to a full handshake
 // (design-mandated: the server rotates its ticket key on restart, which
 // invalidates outstanding tickets); a successful resume consumes the
@@ -340,7 +341,7 @@ func (c *Client) reconnect() error {
 
 	if cred != nil {
 		if err := c.connectOnce(); err == nil {
-			// 0-RTT resume confirmed; the ticket is now consumed.
+			// Ticket resume confirmed; the ticket is now consumed.
 			c.mu.Lock()
 			c.cred = nil
 			c.mu.Unlock()

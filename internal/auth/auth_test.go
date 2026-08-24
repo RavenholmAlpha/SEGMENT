@@ -53,7 +53,7 @@ func TestFullHandshakeAndResume(t *testing.T) {
 	}
 	cs := fullHandshake(t, c, s, connNonce)
 
-	// 0-RTT resume on a new connection (fresh connNonce).
+	// Ticket resume on a new connection (fresh connNonce).
 	newNonce := bytes.Repeat([]byte{0xab}, segment.ConnNonceLen)
 	payload, err := BuildResumePayload(cs, newNonce)
 	if err != nil {

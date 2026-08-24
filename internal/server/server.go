@@ -83,7 +83,7 @@ func Accept(nc net.Conn, opts Options) {
 				_ = st.Reset(0x2) // ErrCodeStreamClosed
 			}
 		}()
-		cs := tunnel.StateFor(c, opts.Auth, opts.Dial, opts.Pacing)
+		cs := tunnel.StateFor(c, opts.Auth, opts.Dial, opts.Pacing, opts.Site.Serve)
 		if err := cs.HandleStream(st); err == tunnel.ErrFakeSite {
 			go opts.Site.Serve(st)
 		}

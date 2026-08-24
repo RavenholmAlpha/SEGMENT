@@ -165,9 +165,9 @@ func TestCrossStreamIsolation(t *testing.T) {
 	}
 }
 
-func TestAuthResumeCleartext(t *testing.T) {
+func TestLegacyAuthResumeCleartext(t *testing.T) {
 	client, server := testSession(t)
-	payload := make([]byte, 100) // resume payload would be 116B
+	payload := make([]byte, 100)
 	rand.Read(payload)
 	cf, err := client.Encode(DirClientToServer, 1, FrameAuthResume, 0, payload, 0)
 	if err != nil {

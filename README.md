@@ -30,17 +30,18 @@ L6  入口 (internal/socks5 + 预留 internal/tun)
   站点同时支持 HTTP/2 与 HTTP/1.1（ALPN 分流）—— 老客户端/企业代理把连接
   降级到 h1.1 时站点依然正常（曾因仅支持 h2 导致这部分客户端"空回复"，
   已修复）；TLS 亦兼容 1.2（真实 CDN 必须，且 1.3 优先）。
-- **应用层 0-RTT**：会话票据（单次使用、服务端加密、内部不含密钥）+ HMAC
-  证明 → 新连接首飞即可带加密数据（Go 标准库 `crypto/tls` 不支持真正的
-  TLS early data，故 0-RTT 做在应用层）。
+- **票据快速恢复**：会话票据（单次使用、服务端加密、内部不含密钥）+ HMAC
+  证明通过普通的 `POST /api/v1/telemetry` 完成；只有服务端确认恢复后，客户端才会
+  打开带媒体标记的控制流和数据流。该流程是一次请求的会话恢复，不宣称 TLS 或应用层
+  0-RTT。
 - **流式 TCP + UDP over TCP**：UDP 一个 FRAME_DATA = 一个数据报，30s 空闲回收。
 - **电信级防检测细节**：Chrome 133 uTLS ClientHello 指纹（`-tls-fingerprint=go` 可退回
   stdlib）、Chrome 1xx 系 SETTINGS、随机 pad 长度(0-255) 但内容全零（与真实浏览器
   一致）、媒体节奏整形（突发 + 抖动停顿）、每流每方向独立子密钥 + 计数器 nonce。
-- **生产级韧性**：客户端凭据持久化（`-cred`，0600，原子写）→ 重启进程即 0-RTT 恢复；
+- **生产级韧性**：客户端凭据持久化（`-cred`，0600，原子写）→ 重启进程可用票据快速恢复；
   断线自动重连（指数退避 1s→30s 上限 + ±30% 抖动；服务端重启导致票据过期时自动
   回退完整握手；Close 可中断进行中的重连）；YAML 配置（`-config`，flag 覆盖）。
-- **稳定性硬化**：未认证请求体的 DoS 防护（鉴权前 body 上限；无效 0-RTT 载荷
+- **稳定性硬化**：未认证请求体的 DoS 防护（鉴权前 body 上限；无效恢复证明
   不占存储）；伪站点行/头长度限额与 h2 preface 识别；TLS/preface 握手超时与
   Accept 瞬时错误退避；SOCKS5 UDP 即时回写（高流量应答不再击穿隧道流控）、
   会话/流 idle 回收与数量上限；relay 任一侧结束即关另一侧、relay 对端 idle 时
@@ -80,9 +81,10 @@ go test ./internal/integration/ -bench . -benchtime 3x -run '^$'
 | 隧道 bulk 1MB（绿色模式） | ≈60–115 MB/s |
 | 隧道 bulk 1MB（生产节奏整形） | ≈36 MB/s |
 | 16KB 往返（时延敏感） | ≈0.5 ms |
-| 0-RTT 重连（TCP+TLS+h2+恢复） | ≈0.5 ms |
+| 旧版 0-RTT 重连历史基准 | ≈0.5 ms（流程已改为鉴权 POST，需重新测量） |
 
-集成测试覆盖：伪站点行为、完整握手、SOCKS5 TCP/UDP、0-RTT 恢复、票据单次
+集成测试覆盖：伪站点行为、未认证媒体标记流的伪站回落、完整握手、SOCKS5 TCP/UDP、
+票据快速恢复、票据单次
 使用（重放拒绝）、错误密钥拒绝。
 
 ## 目录
@@ -90,7 +92,7 @@ go test ./internal/integration/ -bench . -benchtime 3x -run '^$'
 ```
 cmd/segment-server    服务端 CLI（伪站点 + 隧道；-config YAML）
 cmd/segment-client    客户端 CLI（SOCKS5 入口；-config/-cred/-tls-fingerprint）
-internal/auth         PSK 握手、票据、0-RTT 恢复（min-heap 会话驱逐）
+internal/auth         PSK 握手、票据、快速恢复（min-heap 会话驱逐）
 internal/client       客户端连接管理（uTLS 指纹、凭据持久化、断线自愈）
 internal/config       YAML 配置加载
 internal/fakesite     伪视频站点内容生成（h2 + h1.1）

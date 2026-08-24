@@ -1,6 +1,6 @@
 // Package auth implements Segment authentication: the PSK full
 // handshake (an auth blob carried by a normal-looking HTTP POST), the
-// server-issued single-use session ticket, and the 0-RTT resume path.
+// server-issued single-use session ticket, and the ticket resume path.
 //
 // Key material:
 //
@@ -15,8 +15,8 @@
 // The ticket is opaque to the client (encrypted with keySrv) and
 // contains only sessionID + expiry — never the session key. The client
 // caches {ticket, sessionKey} locally and proves knowledge of the key
-// at resume time with an HMAC, which enables 0-RTT: the client can
-// encrypt and send the first data flight before the server responds.
+// at resume time with an HMAC before the client opens its first
+// media-marked tunnel stream.
 package auth
 
 import (
@@ -123,7 +123,7 @@ func (c *Client) BuildAuthRequest(connNonce []byte) (header string, body []byte,
 	return header, body, nil
 }
 
-// ClientSession is the cached credential enabling 0-RTT resume.
+// ClientSession is the cached credential enabling ticket resume.
 type ClientSession struct {
 	Ticket  []byte // opaque to the client
 	Key     [sessionKeyLen]byte
@@ -150,7 +150,7 @@ func (cs *ClientSession) Valid(now time.Time) bool {
 	return now.Before(cs.Expires)
 }
 
-// BuildResumePayload builds the FRAME_AUTH_RESUME payload for 0-RTT:
+// BuildResumePayload builds the ticket-resume POST body:
 // connNonce(16) || ticket(52) || freshNonce(16) || hmac(32).
 func BuildResumePayload(cs *ClientSession, connNonce []byte) ([]byte, error) {
 	fresh := make([]byte, segment.FreshNonceLen)
@@ -336,7 +336,7 @@ func (s *Server) IssueTicket(sess *Session) ([]byte, error) {
 	return append(nonce, ct...), nil
 }
 
-// Resume validates the 0-RTT resume payload and returns the session
+// Resume validates the ticket-resume POST payload and returns the session
 // key. The ticket is single-use: a replayed resume payload is rejected.
 // Invalid payloads (garbage, forged, expired) are rejected *before* the
 // used table is touched, so an unauthenticated flood of bogus resumes

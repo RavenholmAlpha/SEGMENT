@@ -27,19 +27,15 @@ type Client struct {
 
 	mu            sync.Mutex
 	control       *h2x.Stream
-	resuming      bool
-	resumeCh      chan error
 	keepaliveStop chan struct{}
 	closed        bool
-	onFail        chan struct{}
 	authority     string
 }
 
-// Dial establishes the h2 connection and opens the control stream. If
-// cs is a still-valid cached credential, the client immediately sends
-// the 0-RTT AUTH_RESUME and the connection is usable right away; the
-// caller should still call WaitReady to confirm the resume. authority
-// is the Host/SNI used in request headers.
+// Dial establishes the h2 connection. If cs is a still-valid cached
+// credential, it proves that ticket through the ordinary auth POST before
+// opening any media-marked stream. authority is the Host/SNI used in request
+// headers.
 func Dial(tlsConn net.Conn, cfg h2x.Config, authC *auth.Client, cs *auth.ClientSession, authority string) (*Client, error) {
 	h2c, err := h2x.ClientConn(tlsConn, cfg)
 	if err != nil {
@@ -60,58 +56,22 @@ func Dial(tlsConn net.Conn, cfg h2x.Config, authC *auth.Client, cs *auth.ClientS
 		cs:            cs,
 		connNonce:     connNonce,
 		sess:          sess,
-		resumeCh:      make(chan error, 1),
 		keepaliveStop: make(chan struct{}),
-		onFail:        make(chan struct{}),
 		authority:     authority,
 	}
 
-	control, err := h2c.NewStream(c.tunnelHeaders("/videos/channel/sessions-0.m3u8"), false)
-	if err != nil {
-		return nil, err
-	}
-	control.Pad = PadLen
-	c.control = control
-
-	codec := NewCodec(control, sess, segment.DirClientToServer, segment.DirServerToClient)
 	if cs != nil {
 		if !cs.Valid(time.Now()) {
 			c.cs = nil // expired: force full handshake
 		}
 	}
 	if c.cs != nil {
-		// 0-RTT resume: prove possession of the cached session key and
-		// start encrypting data streams immediately.
-		if err := sess.Establish(c.cs.Key[:]); err != nil {
+		if err := c.resume(); err != nil {
+			h2c.GoAway()
 			return nil, err
 		}
-		payload, err := auth.BuildResumePayload(c.cs, connNonce)
-		if err != nil {
-			return nil, err
-		}
-		if err := codec.WriteFrame(segment.FrameAuthResume, 0, payload, 0); err != nil {
-			return nil, err
-		}
-		c.resuming = true
-		go c.waitResumeAck(codec)
 	}
-	go c.keepaliveLoop(codec)
 	return c, nil
-}
-
-// waitResumeAck watches the control stream for the server's FRAME_ACK
-// confirming the resumed session.
-func (c *Client) waitResumeAck(codec *Codec) {
-	f, err := codec.ReadFrame()
-	if err != nil {
-		c.resumeCh <- err
-		return
-	}
-	if f.Type == segment.FrameAck {
-		c.resumeCh <- nil
-		return
-	}
-	c.resumeCh <- errors.New("tunnel: unexpected frame on control stream")
 }
 
 // keepaliveLoop sends FRAME_KEEPALIVE on the control stream; the
@@ -136,24 +96,13 @@ func (c *Client) keepaliveLoop(codec *Codec) {
 	}
 }
 
-// WaitReady returns once the session is confirmed: immediately for the
-// full-handshake path, or after the resume ACK (or its failure). A
-// non-nil error means the resume failed and the caller must redial and
-// complete the full handshake instead.
-func (c *Client) WaitReady(timeout time.Duration) error {
-	if !c.resuming {
-		return nil
-	}
-	select {
-	case err := <-c.resumeCh:
-		return err
-	case <-time.After(timeout):
-		return errors.New("tunnel: resume confirmation timed out")
-	}
-}
+// WaitReady is retained for callers that previously waited for asynchronous
+// resume confirmation. Resume authentication now finishes inside Dial, so a
+// successfully returned Client is ready; timeout is intentionally unused.
+func (c *Client) WaitReady(_ time.Duration) error { return nil }
 
 // Establish performs the full PSK handshake (POST /api/v1/telemetry)
-// and caches the returned credential for future 0-RTT resumes.
+// and caches the returned credential for a future ticket resume.
 func (c *Client) Establish() error {
 	hdr, body, err := c.authC.BuildAuthRequest(c.connNonce)
 	if err != nil {
@@ -186,7 +135,68 @@ func (c *Client) Establish() error {
 	c.mu.Lock()
 	c.cs = cs
 	c.mu.Unlock()
-	return c.sess.Establish(cs.Key[:])
+	if err := c.sess.Establish(cs.Key[:]); err != nil {
+		return err
+	}
+	return c.openControl()
+}
+
+// resume proves a cached ticket inside the ordinary auth POST. Invalid or
+// replayed tickets receive a fake-site response, which cannot be mistaken for
+// the short successful acknowledgement below.
+func (c *Client) resume() error {
+	body, err := auth.BuildResumePayload(c.cs, c.connNonce)
+	if err != nil {
+		return err
+	}
+	st, err := c.h2c.NewStream(c.authHeaders(""), false)
+	if err != nil {
+		return err
+	}
+	if err := st.WriteData(body, true); err != nil {
+		return err
+	}
+	resp, err := readAll(st)
+	if err != nil {
+		return err
+	}
+	if headerValue(st.Headers(), ":status") != "200" || string(resp) != resumeResponse {
+		return errors.New("tunnel: resume authentication rejected")
+	}
+	if err := c.sess.Establish(c.cs.Key[:]); err != nil {
+		return err
+	}
+	return c.openControl()
+}
+
+// openControl starts the encrypted keepalive stream only after the server has
+// established this connection's session. That keeps every unauthenticated
+// media-marked stream on the fake-site path.
+func (c *Client) openControl() error {
+	control, err := c.h2c.NewStream(c.tunnelHeaders(controlPath), false)
+	if err != nil {
+		return err
+	}
+	control.Pad = PadLen
+	c.control = control
+	codec := NewCodec(control, c.sess, segment.DirClientToServer, segment.DirServerToClient)
+	go c.keepaliveLoop(codec)
+	return nil
+}
+
+func (c *Client) authHeaders(proof string) []hpack.HeaderField {
+	hdrs := []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":authority", Value: c.authority},
+		{Name: ":path", Value: "/api/v1/telemetry"},
+		{Name: "content-type", Value: "application/json"},
+		{Name: "user-agent", Value: ua},
+	}
+	if proof != "" {
+		hdrs = append(hdrs, hpack.HeaderField{Name: "x-sg-c", Value: proof})
+	}
+	return hdrs
 }
 
 // OpenTCP opens a tunneled TCP connection to the target.

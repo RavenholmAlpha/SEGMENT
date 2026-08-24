@@ -58,21 +58,29 @@ func hasTunnelMarkers(hdrs []hpack.HeaderField) bool {
 const DataChunk = 16000
 
 const (
-	// resumeTimeout bounds how long a resume confirmation may take.
-	resumeTimeout = 8 * time.Second
 	// udpIdleTimeout reaps idle UDP channels.
 	udpIdleTimeout = 30 * time.Second
+)
+
+const (
+	controlPath    = "/videos/channel/sessions-0.m3u8"
+	resumeResponse = "[]"
 )
 
 // DialFunc dials a target; the tunnel server's outbound gateway.
 type DialFunc func(network, addr string) (net.Conn, error)
 
+// FakeSiteResponder renders a request through the configured cover site. It
+// stays deliberately narrow so tunnel admission can fall back to the cover
+// response without depending on the fakesite package.
+type FakeSiteResponder func(*h2x.Stream)
+
 // ConnState is the per-connection tunnel state on the server.
 type ConnState struct {
-	h2c    *h2x.Conn
 	auth   *auth.Server
 	dial   DialFunc
 	pacing Pacing
+	fake   FakeSiteResponder
 
 	ready chan struct{}
 	once  sync.Once
@@ -85,15 +93,15 @@ type ConnState struct {
 
 // StateFor returns (creating on first use) the tunnel state bound to
 // one h2 connection.
-func StateFor(h2c *h2x.Conn, as *auth.Server, dial DialFunc, pacing Pacing) *ConnState {
+func StateFor(h2c *h2x.Conn, as *auth.Server, dial DialFunc, pacing Pacing, fake FakeSiteResponder) *ConnState {
 	if v, ok := connStates.Load(h2c); ok {
 		return v.(*ConnState)
 	}
 	cs := &ConnState{
-		h2c:     h2c,
 		auth:    as,
 		dial:    dial,
 		pacing:  pacing,
+		fake:    fake,
 		ready:   make(chan struct{}),
 		udpOpen: make(map[uint32]struct{}),
 	}
@@ -120,11 +128,14 @@ func (cs *ConnState) HandleStream(st *h2x.Stream) error {
 	path := headerValue(hdrs, ":path")
 	isTunnel := hasTunnelMarkers(hdrs)
 
-	if st.ID() == 1 && isTunnel {
-		go cs.handleControl(st)
-		return nil
+	if isTunnel && !cs.Ready() {
+		return ErrFakeSite
 	}
 	if isTunnel {
+		if path == controlPath {
+			go cs.handleControl(st)
+			return nil
+		}
 		go cs.handleTunnel(st)
 		return nil
 	}
@@ -135,65 +146,26 @@ func (cs *ConnState) HandleStream(st *h2x.Stream) error {
 	return ErrFakeSite
 }
 
-// handleControl services the control stream: 0-RTT resume, then
-// keepalive/ack. On resume failure it tears the connection down so the
-// client falls back to the full handshake. A full-handshake client
-// (whose session key was established by the auth POST) also opens
-// stream 1 with tunnel markers and sends *encrypted* keepalives; those
-// are decoded against the established session instead of being RST'd.
-func (cs *ConnState) handleControl(st *h2x.Stream) {
-	// The first payload is either a cleartext AUTH_RESUME frame
-	// (0-RTT clients) or an encrypted frame under the session key
-	// (full-handshake clients once their POST completed).
-	clearSess, err := segment.NewSession(make([]byte, segment.ConnNonceLen))
-	if err != nil {
-		_ = st.Reset(0x1)
-		return
-	}
-	first, _, err := st.ReadData()
-	if err != nil {
-		return
-	}
-	f, err := clearSess.Decode(segment.DirClientToServer, st.ID(), first)
-	if err == nil && f.Type == segment.FrameAuthResume {
-		sess, rerr := cs.auth.Resume(f.Payload)
-		if rerr != nil {
-			// Kill the whole connection: resume failed; the client must
-			// reconnect and complete the full handshake.
-			cs.readyFail(rerr)
-			_ = st.Reset(0x2) // ErrCodeStreamClosed
-			go cs.h2c.GoAway()
-			return
-		}
-		connNonce := f.Payload[:segment.ConnNonceLen]
-		cs.establish(connNonce, sess.Key[:])
-		// Confirm to the client that the session is live (FRAME_ACK).
-		codec := NewCodec(st, cs.sess, segment.DirServerToClient, segment.DirClientToServer)
-		_ = codec.WriteFrame(segment.FrameAck, 0, segment.BuildAckPayload(1), 0)
-		cs.keepaliveLoop(codec)
-		return
-	}
-
-	// Full-handshake client: wait for the session established by the
-	// auth POST, then decode the first frame under it.
+// Ready reports whether this connection has an established tunnel session.
+// Closing ready synchronizes the session fields written by establish/readyFail
+// with all later stream handlers.
+func (cs *ConnState) Ready() bool {
 	select {
 	case <-cs.ready:
-	case <-time.After(resumeTimeout):
-		_ = st.Reset(0x1)
-		return
+		return cs.err == nil && cs.sess != nil
+	default:
+		return false
 	}
-	if cs.err != nil {
-		_ = st.Reset(0x1)
+}
+
+// handleControl services the encrypted keepalive/ack stream. Admission has
+// already verified that a session is established, so no unauthenticated media
+// request can reach this handler.
+func (cs *ConnState) handleControl(st *h2x.Stream) {
+	if err := cs.writeTunnelHeaders(st); err != nil {
 		return
 	}
 	codec := NewCodec(st, cs.sess, segment.DirServerToClient, segment.DirClientToServer)
-	if f2, derr := cs.sess.Decode(segment.DirClientToServer, st.ID(), first); derr == nil {
-		if f2.Type == segment.FrameKeepalive {
-			if ts, perr := segment.ParseKeepalivePayload(f2.Payload); perr == nil {
-				_ = codec.WriteFrame(segment.FrameAck, 0, segment.BuildAckPayload(ts), 0)
-			}
-		}
-	}
 	cs.keepaliveLoop(codec)
 }
 
@@ -218,24 +190,28 @@ func (cs *ConnState) keepaliveLoop(codec *Codec) {
 	}
 }
 
-// handleAuthPost completes the full handshake (POST /api/v1/telemetry,
-// body = auth blob) and establishes the connection session.
+// handleAuthPost completes either the full PSK handshake or ticket resume on
+// the ordinary POST /api/v1/telemetry path, then establishes the connection
+// session. Any missing or invalid proof receives the configured fake site.
 func (cs *ConnState) handleAuthPost(st *h2x.Stream) {
 	hdr := headerValue(st.Headers(), "x-sg-c")
 	body, err := readAll(st)
 	if err != nil {
+		cs.serveFake(st)
+		return
+	}
+	if hdr == "" {
+		cs.handleResumePost(st, body)
 		return
 	}
 	sess, connNonce, err := cs.auth.VerifyAuth(hdr, body)
 	if err != nil {
-		_ = st.WriteHeaders([]hpack.HeaderField{{Name: ":status", Value: "403"}}, false)
-		_ = st.CloseSend()
+		cs.serveFake(st)
 		return
 	}
 	ticket, err := cs.auth.IssueTicket(sess)
 	if err != nil {
-		_ = st.WriteHeaders([]hpack.HeaderField{{Name: ":status", Value: "500"}}, false)
-		_ = st.CloseSend()
+		cs.serveFake(st)
 		return
 	}
 	resp := make([]byte, 0, len(ticket)+32)
@@ -258,6 +234,34 @@ func (cs *ConnState) handleAuthPost(st *h2x.Stream) {
 	}
 }
 
+func (cs *ConnState) handleResumePost(st *h2x.Stream, body []byte) {
+	sess, err := cs.auth.Resume(body)
+	if err != nil {
+		cs.serveFake(st)
+		return
+	}
+	connNonce := body[:segment.ConnNonceLen]
+	cs.establish(connNonce, sess.Key[:])
+	if err := st.WriteHeaders([]hpack.HeaderField{
+		{Name: ":status", Value: "200"},
+		{Name: "content-type", Value: "application/json"},
+		{Name: "content-length", Value: strconv.Itoa(len(resumeResponse))},
+	}, false); err != nil {
+		return
+	}
+	_ = st.WriteData([]byte(resumeResponse), true)
+}
+
+// serveFake uses the fronting layer's configured responder for failures that
+// are discovered after HandleStream returned. At this point the tunnel package
+// cannot return ErrFakeSite to its caller, so the callback preserves the same
+// cover-site boundary without importing fakesite here.
+func (cs *ConnState) serveFake(st *h2x.Stream) {
+	if cs.fake != nil {
+		cs.fake(st)
+	}
+}
+
 // establish creates the per-connection Segment session and unblocks
 // tunnel streams.
 func (cs *ConnState) establish(connNonce, sessionKey []byte) {
@@ -274,28 +278,10 @@ func (cs *ConnState) establish(connNonce, sessionKey []byte) {
 	})
 }
 
-// readyFail permanently fails the connection session.
-func (cs *ConnState) readyFail(err error) {
-	cs.once.Do(func() {
-		cs.err = err
-		close(cs.ready)
-	})
-}
-
 // handleTunnel services a data stream: wait for the session, read the
 // FRAME_OPEN, then relay to the target.
 func (cs *ConnState) handleTunnel(st *h2x.Stream) {
-	select {
-	case <-cs.ready:
-	case <-time.After(resumeTimeout):
-		// Bounded regardless of how long the (possibly unauthenticated)
-		// connection has been pending, so an unmatched stream cannot
-		// pin a server goroutine for long.
-		_ = st.Reset(0x1)
-		return
-	}
-	if cs.err != nil {
-		_ = st.Reset(0x1)
+	if err := cs.writeTunnelHeaders(st); err != nil {
 		return
 	}
 	codec := NewCodec(st, cs.sess, segment.DirServerToClient, segment.DirClientToServer)
@@ -322,6 +308,15 @@ func (cs *ConnState) handleTunnel(st *h2x.Stream) {
 		return
 	}
 	cs.relayTCP(codec, target)
+}
+
+// writeTunnelHeaders emits the normal media response header block that must
+// precede every authenticated tunnel/control DATA frame.
+func (cs *ConnState) writeTunnelHeaders(st *h2x.Stream) error {
+	return st.WriteHeaders([]hpack.HeaderField{
+		{Name: ":status", Value: "200"},
+		{Name: "content-type", Value: "video/mp4"},
+	}, false)
 }
 
 // relayTCP pipes the tunnel stream to a TCP socket.

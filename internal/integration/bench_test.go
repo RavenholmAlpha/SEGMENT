@@ -144,8 +144,8 @@ func BenchmarkTunnelBulk1MPaced(b *testing.B) {
 	}
 }
 
-// BenchmarkResumeHandshake measures the 0-RTT resume path only: TCP +
-// TLS + h2 + AUTH_RESUME + ACK confirmation. Because tickets are
+// BenchmarkResumeHandshake measures the ticket-resume path only: TCP +
+// TLS + h2 + authentication POST confirmation. Because tickets are
 // single-use, each iteration first completes a (unmeasured) full
 // handshake to obtain a fresh credential.
 func BenchmarkResumeHandshake(b *testing.B) {

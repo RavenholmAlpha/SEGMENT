@@ -13,12 +13,12 @@
 //
 // The header is 4 bytes; Length is the payload size (ciphertext,
 // including the 16-byte GCM tag) for encrypted frames, or the
-// plaintext size for the cleartext FrameAuthResume frame.
+// plaintext size for the legacy cleartext FrameAuthResume frame.
 //
 // Segment frames are carried one-per HTTP/2 DATA frame, so a stream ID
-// is not needed inside the frame. FrameAuthResume is the only frame
-// whose payload travels in cleartext: it carries an opaque ticket and
-// an HMAC proving possession of the session key (see internal/auth).
+// is not needed inside the frame. FrameAuthResume is a legacy wire type;
+// current tunnel admission sends the ticket proof in an ordinary auth POST
+// before any Segment stream is opened.
 package segment
 
 import (
@@ -36,7 +36,7 @@ const (
 	FrameClose      FrameType = 2 // bidirectional: close channel
 	FrameKeepalive  FrameType = 3 // bidirectional: keepalive (control stream)
 	FrameAck        FrameType = 4 // bidirectional: ack of control frames
-	FrameAuthResume FrameType = 5 // C→S: 0-RTT resume (cleartext payload)
+	FrameAuthResume FrameType = 5 // legacy C→S cleartext resume; transport no longer emits it
 	frameTypeMax    FrameType = 6
 )
 

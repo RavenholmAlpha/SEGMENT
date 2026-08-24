@@ -17,7 +17,7 @@ psk: "在此填入与服务端相同的密钥"
 socks: 127.0.0.1:1080
 
 # 会话凭据缓存文件（0600 权限，进程会原子写入）。
-# 强烈建议配置：重启客户端/断线恢复后走 0-RTT，无需重新完整握手。
+# 强烈建议配置：重启客户端/断线后可用票据快速恢复，无需重新完整握手。
 cred_file: /var/lib/segment/client-cred.json
 
 # TLS ClientHello 指纹: chrome（默认，uTLS HelloChrome_Auto，防 TLS 指纹识别）| go（标准库形态）
