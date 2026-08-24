@@ -1,0 +1,23 @@
+# segment-server 生产部署配置样例
+# 用法: segment-server -config /etc/segment/server.yaml
+#
+# 所有字段都可被命令行 flag 覆盖（-listen / -cert / -key / -psk / -pacing ...）
+
+listen: 0.0.0.0:443
+
+# 正式 TLS 证书（PEM）。建议 Let's Encrypt / 云厂商证书，域名与客户端 sni 一致。
+# 仅开发环境可改配 insecure: true（服务端自签，客户端须 -insecure）。
+cert: /etc/segment/fullchain.pem
+key:  /etc/segment/privkey.pem
+
+# 预共享密钥：两端必须完全一致，至少 32 字节，建议 32+ 字节高强度随机值。
+# 泄漏 = 隧道完全失守。更换 PSK 后旧客户端会自动回退完整握手，无需重启客户端。
+psk: "在此填入至少32字节的随机密钥"
+
+# 媒体节奏整形（L5 反检测）：把隧道出口流量塑造成视频流媒体形态。
+# 校验约束：0 < min_pause_ms <= max_pause_ms，且不要配置巨值（会自我限速）。
+pacing:
+  enabled: true
+  burst_kb: 256        # 每次突发 256KB
+  min_pause_ms: 2      # 突发间随机停顿 2–8 ms
+  max_pause_ms: 8

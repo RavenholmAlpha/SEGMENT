@@ -1,0 +1,26 @@
+# segment-client systemd 单元样例（VPS 端部署时）
+# 安装: 复制到 /etc/systemd/system/segment-client.service
+#       systemctl daemon-reload && systemctl enable --now segment-client
+#
+# 二进制路径按实际部署调整（本文假设 /opt/segment/bin/segment-client）。
+# 客户端只监听 127.0.0.1:1080，可在任意主机（本机、软路由、网关机）运行。
+
+[Unit]
+Description=Segment tunnel client (local SOCKS5 ingress)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=segment
+Group=segment
+ExecStart=/opt/segment/bin/segment-client -config /etc/segment/client.yaml
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/segment
+
+[Install]
+WantedBy=multi-user.target

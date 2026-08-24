@@ -1,0 +1,28 @@
+# segment-client 生产部署配置样例
+# 用法: segment-client -config /etc/segment/client.yaml
+#
+# 客户端只在本地 loopback 监听 SOCKS5；断线自动重连(1s–30s 指数退避+抖动)，
+# 服务端重启后自动回退完整握手并缓存新票据。
+
+server: vps.example.com:443
+
+# TLS SNI / :authority；默认取 server 的主机名。
+# 必须与服务器证书的域名一致，否则 TLS 握手失败。
+sni: vps.example.com
+
+# 与服务器完全一致的 PSK（>= 32 字节）。
+psk: "在此填入与服务端相同的密钥"
+
+# 本地 SOCKS5 监听地址。只绑 127.0.0.1，不要对外开放。
+socks: 127.0.0.1:1080
+
+# 会话凭据缓存文件（0600 权限，进程会原子写入）。
+# 强烈建议配置：重启客户端/断线恢复后走 0-RTT，无需重新完整握手。
+cred_file: /var/lib/segment/client-cred.json
+
+# TLS ClientHello 指纹: chrome（默认，uTLS HelloChrome_Auto，防 TLS 指纹识别）| go（标准库形态）
+tls_fingerprint: chrome
+
+# 正式证书（公有 CA）无需任何配置，自动走系统根证书库。
+# 仅当服务器使用私有 CA 签发的证书时需要：
+# ca_file: /etc/segment/vps-ca.pem

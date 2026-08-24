@@ -1,0 +1,31 @@
+# segment-server systemd 单元样例
+# 安装: 复制到 /etc/systemd/system/segment-server.service
+#       systemctl daemon-reload && systemctl enable --now segment-server
+#
+# 二进制路径按实际部署调整（本文假设 /opt/segment/bin/segment-server）。
+# 建议以专用低权限用户运行；仅需 443/tcp 监听权限（或用 443 前加反向代理）。
+
+[Unit]
+Description=Segment fronting server (fake video site + tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=segment
+Group=segment
+ExecStart=/opt/segment/bin/segment-server -config /etc/segment/server.yaml
+Restart=always
+RestartSec=2
+# 配合证书续期（certbot renew --deploy-hook 或 reload 钩子）：
+# 证书轮换后重启进程以加载新证书。
+ExecReload=/bin/kill -HUP $MAINPID
+# 基本加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/etc/segment
+# 日志交给 systemd journal（journalctl -u segment-server）
+
+[Install]
+WantedBy=multi-user.target

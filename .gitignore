@@ -1,0 +1,16 @@
+# Go build artifacts (redirected to workspace-local dirs in this env)
+.gocache/
+.gotmp/
+
+# Local runtime artifacts (logs, smoke tests, local configs)
+out/
+
+# Binaries
+/bin/
+*.exe
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
